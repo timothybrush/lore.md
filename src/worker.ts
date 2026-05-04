@@ -8,6 +8,20 @@ export interface Env {
   GATEWAY_TOKEN?: string;
 }
 
+type DomainRecord = {
+  text: string;
+  generatedAt: string;
+};
+
+type XaiChatCompletion = {
+  choices?: Array<{
+    delta?: { content?: string };
+    message?: { content?: string };
+  }>;
+  output_text?: string;
+  response?: string;
+};
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -15,7 +29,7 @@ export default {
     const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
     const version = "v15";
 
-  const cacheKey = new Request(`https://${host}/${version}/__md/${today}`, {
+    const cacheKey = new Request(`https://${host}/${version}/__md/${today}`, {
       method: "GET",
     });
 
@@ -29,13 +43,12 @@ export default {
       headers: { host, "x-md-version": version },
     });
     if (doRes.ok) {
-      /** @type {{ text: string, generatedAt: string }} */
-      const payload = await doRes.json();
-    const html = renderPage({
-      host,
-      text: payload.text,
-      generatedAt: payload.generatedAt,
-    });
+      const payload = (await doRes.json()) as DomainRecord;
+      const html = renderPage({
+        host,
+        text: payload.text,
+        generatedAt: payload.generatedAt,
+      });
       const response = new Response(html, {
         headers: {
           "content-type": "text/html; charset=utf-8",
@@ -55,7 +68,7 @@ export default {
 };
 
 // Export helpers for testing.
-export { buildPrompt, fallbackText, renderPage };
+export { buildPrompt, fallbackText, generateDailyText, renderPage };
 
 export class DomainDO {
   state: DurableObjectState;
@@ -68,7 +81,6 @@ export class DomainDO {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const host = request.headers.get("host") || url.host || "localhost";
     const today = new Date().toISOString().slice(0, 10);
     const version = request.headers.get("x-md-version") || "v1";
     const key = `${version}-${today}`;
@@ -80,9 +92,7 @@ export class DomainDO {
         generatedAt: (body as any).generatedAt || today,
       };
       await this.state.blockConcurrencyWhile(async () => {
-        await this.state.storage.put(key, record, {
-          expirationTtl: 60 * 60 * 27,
-        });
+        await this.state.storage.put(key, record);
       });
       return json({ stored: true });
     }
@@ -110,8 +120,7 @@ async function callXai(env: Env, prompt: string): Promise<string> {
     throw new Error("XAI_API_KEY is not set");
   }
   const apiBase =
-    env.GATEWAY_BASE ||
-    "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat";
+    env.GATEWAY_BASE || "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat";
   const body = {
     model: "grok-4-1-fast-reasoning",
     messages: [
@@ -142,22 +151,22 @@ async function callXai(env: Env, prompt: string): Promise<string> {
     throw new Error(`xAI error ${res.status}: ${msg}`);
   }
 
-  const data = await res.json();
-  const text =
-    data?.choices?.[0]?.message?.content ||
-    data?.output_text ||
-    data?.response;
+  const data = (await res.json()) as XaiChatCompletion;
+  const text = data?.choices?.[0]?.message?.content || data?.output_text || data?.response;
   if (!text) throw new Error("xAI response missing content");
   return text;
 }
 
-async function callXaiStream(env: Env, prompt: string, onChunk: (chunk: string) => Promise<void> | void): Promise<void> {
+async function callXaiStream(
+  env: Env,
+  prompt: string,
+  onChunk: (chunk: string) => Promise<void> | void,
+): Promise<void> {
   if (!env.XAI_API_KEY) {
     throw new Error("XAI_API_KEY is not set");
   }
   const apiBase =
-    env.GATEWAY_BASE ||
-    "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat";
+    env.GATEWAY_BASE || "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat";
   const body = {
     model: "grok-4-1-fast-reasoning",
     messages: [
@@ -205,11 +214,9 @@ async function callXaiStream(env: Env, prompt: string, onChunk: (chunk: string) 
         return;
       }
       try {
-        const json = JSON.parse(data);
+        const json = JSON.parse(data) as XaiChatCompletion;
         const delta =
-          json?.choices?.[0]?.delta?.content ||
-          json?.choices?.[0]?.message?.content ||
-          "";
+          json?.choices?.[0]?.delta?.content || json?.choices?.[0]?.message?.content || "";
         if (delta) await onChunk(delta);
       } catch (e) {
         console.error("stream parse error", e);
@@ -218,7 +225,7 @@ async function callXaiStream(env: Env, prompt: string, onChunk: (chunk: string) 
   }
 }
 
-function buildPrompt(host, today) {
+function buildPrompt(host: string, today: string): string {
   return `Write a reflective Markdown piece (220-400 words) for the site "${host}".
 Theme: find a simple, thoughtful meaning, metaphor, or philosophy inspired by the domain name.
 Tone: calm, sincere, meaningful; avoid jargon and clichés; use clear, everyday language.
@@ -232,7 +239,7 @@ Constraints: keep it under ~400 words, English only.
 Add a one-line italicized closing thought. Date context: ${today} UTC.`;
 }
 
-function fallbackText(host, today) {
+function fallbackText(host: string, today: string): string {
   return `# ${host}
 
 We meant to hand you something thoughtful today, but the generator blinked.
@@ -242,7 +249,14 @@ Until it wakes, take this small reminder: meaning often shows up after the first
 _Generated on ${today} UTC; cached until the next sunrise._`;
 }
 
-async function streamGenerate(host: string, today: string, version: string, env: Env, stub: DurableObjectStub, ctx: ExecutionContext): Promise<Response> {
+async function streamGenerate(
+  host: string,
+  today: string,
+  version: string,
+  env: Env,
+  stub: DurableObjectStub,
+  ctx: ExecutionContext,
+): Promise<Response> {
   const prompt = buildPrompt(host, today);
   const ts = new TransformStream();
   const writer = ts.writable.getWriter();
@@ -259,7 +273,7 @@ async function streamGenerate(host: string, today: string, version: string, env:
   ctx.waitUntil(
     (async () => {
       let collected = "";
-      const collect = async (chunk) => {
+      const collect = async (chunk: string) => {
         collected += chunk;
       };
 
@@ -302,13 +316,21 @@ async function streamGenerate(host: string, today: string, version: string, env:
       } finally {
         await writer.close();
       }
-    })()
+    })(),
   );
 
   return response;
 }
 
-function renderPage({ host, text, generatedAt }: { host: string; text: string; generatedAt: string }) {
+function renderPage({
+  host,
+  text,
+  generatedAt,
+}: {
+  host: string;
+  text: string;
+  generatedAt: string;
+}) {
   const rendered = renderMarkdown(text);
   return wrapShell(host, rendered, generatedAt);
 }
@@ -410,7 +432,7 @@ async function safeText(res: Response): Promise<string> {
   }
 }
 
-function renderHead(host) {
+function renderHead(host: string): string {
   const css = `
 :root { color-scheme: light dark; }
 body {
@@ -468,7 +490,7 @@ p { margin: 0.3rem 0 0.6rem; }
   <pre>`;
 }
 
-function renderFooter(generatedAt) {
+function renderFooter(generatedAt: string): string {
   return `</pre>
   <footer>
     <span>Generated on ${generatedAt} UTC</span>
@@ -478,11 +500,11 @@ function renderFooter(generatedAt) {
 </html>`;
 }
 
-function renderMarkdown(markdown) {
+function renderMarkdown(markdown: string): string {
   // render inline tags but keep decorators visible
   let escaped = escapeHtml(markdown);
-  escaped = escaped.replace(/\*\*(.+?)\*\*/g, '<strong>*$1*</strong>');
-  escaped = escaped.replace(/\*(.+?)\*/g, '<em>*$1*</em>');
-  escaped = escaped.replace(/~~(.+?)~~/g, '<del>~~$1~~</del>');
+  escaped = escaped.replace(/\*\*(.+?)\*\*/g, "<strong>*$1*</strong>");
+  escaped = escaped.replace(/\*(.+?)\*/g, "<em>*$1*</em>");
+  escaped = escaped.replace(/~~(.+?)~~/g, "<del>~~$1~~</del>");
   return escaped;
 }

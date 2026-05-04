@@ -5,9 +5,7 @@ account_id = "de09342a728de2c25c85cc6b34d68739"
 workers_dev = true
 
 [durable_objects]
-bindings = [
-  { name = "DOMAIN_DO", class_name = "DomainDO" }
-]
+bindings = [{ name = "DOMAIN_DO", class_name = "DomainDO" }]
 
 [[migrations]]
 tag = "v1"
