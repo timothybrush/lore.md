@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DomainDO, buildPrompt, fallbackText, renderPage } from "../src/worker";
+import worker, { DomainDO, buildPrompt, fallbackText, renderPage } from "../src/worker";
 
 describe("prompt", () => {
   it("includes host and date", () => {
@@ -89,6 +89,96 @@ describe("DomainDO daily generation", () => {
     expect(first.text).toContain("generator blinked");
     expect(second).toEqual(first);
   });
+
+  it("stores deterministic fallback after whitespace-only upstream content", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "   \n\t  " } }],
+          }),
+          { headers: { "content-type": "application/json" } },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const domainDO = new DomainDO(createState(), { XAI_API_KEY: "xai-key" });
+    const request = new Request("https://domain-do/daily", {
+      headers: { "x-md-host": "example.com", "x-md-version": "v15" },
+    });
+
+    const record = await domainDO.fetch(request).then((res) => res.json());
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(record.text).toContain("generator blinked");
+  });
+});
+
+describe("worker fetch", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2025-12-05T12:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it.each(["/", "/stream"])("routes %s cold misses through the daily DO path", async (path) => {
+    const cache = createCache();
+    vi.stubGlobal("caches", { default: cache });
+    const doFetch = vi.fn(async () =>
+      Response.json({ text: "# Daily page", generatedAt: "2025-12-05" }),
+    );
+    const env = createEnv(doFetch);
+    const ctx = createContext();
+
+    const response = await worker.fetch(
+      new Request(`https://example.com${path}`, { headers: { host: "example.com" } }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("# Daily page");
+    expect(doFetch).toHaveBeenCalledWith("https://domain-do/daily", {
+      headers: { "x-md-host": "example.com", "x-md-version": "v15" },
+    });
+    expect(cache.put).toHaveBeenCalledTimes(1);
+    expect(response.headers.get("x-md-version")).toBe("v15");
+    expect(response.headers.get("x-generated-on")).toBe("2025-12-05");
+  });
+
+  it("renders and caches fallback when the DO request throws", async () => {
+    const cache = createCache();
+    vi.stubGlobal("caches", { default: cache });
+    const doFetch = vi.fn(async () => {
+      throw new Error("DO unavailable");
+    });
+    const env = createEnv(doFetch);
+    const ctx = createContext();
+
+    const response = await worker.fetch(new Request("https://example.com/"), env, ctx);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("generator blinked");
+    expect(cache.put).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders and caches fallback when the DO response is malformed", async () => {
+    const cache = createCache();
+    vi.stubGlobal("caches", { default: cache });
+    const doFetch = vi.fn(async () => new Response("{", { headers: { "content-type": "json" } }));
+    const env = createEnv(doFetch);
+    const ctx = createContext();
+
+    const response = await worker.fetch(new Request("https://example.com/"), env, ctx);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("generator blinked");
+    expect(cache.put).toHaveBeenCalledTimes(1);
+  });
 });
 
 function createState() {
@@ -101,5 +191,28 @@ function createState() {
         values.set(key, value);
       }),
     },
+  };
+}
+
+function createEnv(fetch) {
+  return {
+    DOMAIN_DO: {
+      idFromName: vi.fn((name) => name),
+      get: vi.fn(() => ({ fetch })),
+    },
+    XAI_API_KEY: "xai-key",
+  };
+}
+
+function createCache() {
+  return {
+    match: vi.fn(async () => undefined),
+    put: vi.fn(async () => undefined),
+  };
+}
+
+function createContext() {
+  return {
+    waitUntil: vi.fn(),
   };
 }

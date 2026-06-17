@@ -39,21 +39,21 @@ export default {
 
     // 1b) Ask DO for today's text; if present, render and cache.
     const stub = env.DOMAIN_DO.get(env.DOMAIN_DO.idFromName(host));
-    const doRes = await stub.fetch("https://domain-do/daily", {
-      headers: { "x-md-host": host, "x-md-version": version },
-    });
-    if (doRes.ok) {
-      const payload = (await doRes.json()) as DomainRecord;
-      const response = renderHtmlResponse(host, payload.text, payload.generatedAt, version);
-      ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
-      return response;
+    try {
+      const doRes = await stub.fetch("https://domain-do/daily", {
+        headers: { "x-md-host": host, "x-md-version": version },
+      });
+      if (doRes.ok) {
+        const payload = (await doRes.json()) as DomainRecord;
+        const response = renderHtmlResponse(host, payload.text, payload.generatedAt, version);
+        ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
+        return response;
+      }
+    } catch (err) {
+      console.error("DO daily lookup error", err);
     }
 
-    // If the DO itself fails, still return a deterministic response instead of retrying forever.
-    const text = fallbackText(host, today);
-    const response = renderHtmlResponse(host, text, today, version);
-    ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
-    return response;
+    return renderFallbackAndCache(host, today, version, cacheKey, ctx);
   },
 };
 
@@ -120,7 +120,9 @@ async function generateDailyText(env: Env, host: string, today: string): Promise
 
   try {
     const text = await callXai(env, prompt);
-    return text.trim();
+    const trimmed = text.trim();
+    if (!trimmed) throw new Error("xAI response missing content");
+    return trimmed;
   } catch (err) {
     console.error("AI generation error", err);
     return fallbackText(host, today);
@@ -149,14 +151,22 @@ async function callXai(env: Env, prompt: string): Promise<string> {
     stream: false,
   };
 
-  const res = await fetch(`${apiBase}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${env.GATEWAY_TOKEN || env.XAI_API_KEY}`,
-    },
-    body: JSON.stringify(body),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25_000);
+  let res: Response;
+  try {
+    res = await fetch(`${apiBase}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${env.GATEWAY_TOKEN || env.XAI_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!res.ok) {
     const msg = await safeText(res);
@@ -221,6 +231,19 @@ function renderHtmlResponse(
       "x-md-version": version,
     },
   });
+}
+
+function renderFallbackAndCache(
+  host: string,
+  today: string,
+  version: string,
+  cacheKey: Request,
+  ctx: ExecutionContext,
+): Response {
+  const text = fallbackText(host, today);
+  const response = renderHtmlResponse(host, text, today, version);
+  ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
+  return response;
 }
 
 function wrapShell(host: string, renderedHtml: string, generatedAt: string) {
