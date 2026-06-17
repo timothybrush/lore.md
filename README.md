@@ -10,6 +10,7 @@ What it uses
 - Cloudflare AI Gateway (OpenAI-compatible) pointing to xAI Grok 4.1 fast reasoning
 - Edge cache 24h
 - Durable Object request coalescing so cold misses share one daily generation
+- Optional streaming path `/stream` to show the first generation live on cache miss
 
 Quick start
 
@@ -29,13 +30,13 @@ Behavior
 - Prompt: philosophical, host-aware, ~220–400 words, H1 + H2 sections, optional single bullet list, italic closing line.
 - Fallback text is deterministic if the AI call fails, and is stored for that host/day.
 - Footer shows generation date and a right-aligned link “a @steipete project” → https://steipete.me.
-- `/stream` returns the same daily page through the same DO-coordinated path, so it cannot bypass the one-generation-per-day guard.
+- Streaming: request `/stream` to stream the first uncached generation live through the Durable Object. Concurrent `/` or `/stream` misses wait on the same in-flight generation, so streaming cannot bypass the one-generation-per-day guard.
 
 Testing
 
 - `wrangler dev` then curl twice: `curl -H "Host: yourdomain.test" http://127.0.0.1:8787` and confirm `X-Generated-On` stays fixed.
 - Check AI Gateway analytics to verify only one upstream call per domain per day.
-- Stream path test: `curl http://127.0.0.1:8787/stream` and confirm it returns the same daily page.
+- Stream path test: `curl -N http://127.0.0.1:8787/stream` on a fresh day to observe live output.
 
 Config references
 

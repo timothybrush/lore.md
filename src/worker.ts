@@ -37,15 +37,16 @@ export default {
     const cached = await caches.default.match(cacheKey);
     if (cached) return cached;
 
-    // 1b) Ask DO for today's text; if present, render and cache.
+    // 1b) Ask DO for today's text; /stream preserves live output on the first miss.
     const stub = env.DOMAIN_DO.get(env.DOMAIN_DO.idFromName(host));
     try {
-      const doRes = await stub.fetch("https://domain-do/daily", {
+      const doPath = url.pathname === "/stream" ? "/stream" : "/daily";
+      const doRes = await stub.fetch(`https://domain-do${doPath}`, {
         headers: { "x-md-host": host, "x-md-version": version },
       });
       if (doRes.ok) {
-        const payload = (await doRes.json()) as DomainRecord;
-        const response = renderHtmlResponse(host, payload.text, payload.generatedAt, version);
+        const response =
+          doPath === "/stream" ? doRes : renderDailyResponse(host, await doRes.json(), version);
         ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
         return response;
       }
@@ -83,6 +84,10 @@ export class DomainDO {
       return json(record);
     }
 
+    if (url.pathname === "/stream") {
+      return this.streamDailyRecord(key, host, today, version);
+    }
+
     const existing = await this.state.storage.get<any>(key);
     if (existing) return json(existing);
     return new Response("not found", { status: 404 });
@@ -111,6 +116,85 @@ export class DomainDO {
       return await promise;
     } finally {
       this.inflight.delete(key);
+    }
+  }
+
+  private async streamDailyRecord(
+    key: string,
+    host: string,
+    today: string,
+    version: string,
+  ): Promise<Response> {
+    const existing = await this.state.storage.get<DomainRecord>(key);
+    if (existing) return renderHtmlResponse(host, existing.text, existing.generatedAt, version);
+
+    const pending = this.inflight.get(key);
+    if (pending) {
+      const record = await pending;
+      return renderHtmlResponse(host, record.text, record.generatedAt, version);
+    }
+
+    const stream = new TransformStream();
+    const writer = stream.writable.getWriter();
+    const encoder = new TextEncoder();
+
+    const promise = this.generateStreamedRecord(key, host, today, writer, encoder);
+    this.inflight.set(key, promise);
+    void promise.finally(() => this.inflight.delete(key));
+
+    return new Response(stream.readable, {
+      headers: htmlHeaders(host, version, today),
+    });
+  }
+
+  private async generateStreamedRecord(
+    key: string,
+    host: string,
+    today: string,
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    encoder: TextEncoder,
+  ): Promise<DomainRecord> {
+    let collected = "";
+    let writeQueue = Promise.resolve();
+    const enqueue = (html: string) => {
+      writeQueue = writeQueue
+        .then(() => writer.write(encoder.encode(html)))
+        .catch((err) => console.error("stream write error", err));
+    };
+    const closeStream = () => {
+      void writeQueue
+        .then(() => writer.close())
+        .catch((err) => console.error("stream close error", err));
+    };
+
+    try {
+      enqueue(renderShellStart(host));
+      await callXaiStream(this.env, buildPrompt(host, today), async (chunk) => {
+        collected += chunk;
+        enqueue(renderMarkdownChunk(chunk));
+      });
+
+      const text = collected.trim();
+      const finalText = text || fallbackText(host, today);
+      if (!text) {
+        enqueue(renderMarkdownChunk(finalText));
+      }
+      const record = { text: finalText, generatedAt: today };
+      await this.state.storage.put(key, record);
+      enqueue(renderShellEnd(today));
+      closeStream();
+      return record;
+    } catch (err) {
+      console.error("AI stream generation error", err);
+      const fallback = fallbackText(host, today);
+      const record = { text: fallback, generatedAt: today };
+      await this.state.storage.put(key, record);
+      if (!collected.trim()) {
+        enqueue(renderMarkdownChunk(fallback));
+      }
+      enqueue(renderShellEnd(today));
+      closeStream();
+      return record;
     }
   }
 }
@@ -179,6 +263,80 @@ async function callXai(env: Env, prompt: string): Promise<string> {
   return text;
 }
 
+async function callXaiStream(
+  env: Env,
+  prompt: string,
+  onChunk: (chunk: string) => Promise<void> | void,
+): Promise<void> {
+  if (!env.XAI_API_KEY) {
+    throw new Error("XAI_API_KEY is not set");
+  }
+  const apiBase =
+    env.GATEWAY_BASE || "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat";
+  const body = {
+    model: "grok-4-1-fast-reasoning",
+    messages: [
+      {
+        role: "system",
+        content:
+          "You write concise, thoughtful Markdown essays. No HTML. No images. Do not mention the prompt itself.",
+      },
+      { role: "user", content: prompt },
+    ],
+    temperature: 0.6,
+    top_p: 0.9,
+    max_tokens: 500,
+    stream: true,
+  };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25_000);
+  let res: Response;
+  try {
+    res = await fetch(`${apiBase}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${env.GATEWAY_TOKEN || env.XAI_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!res.ok || !res.body) {
+    const msg = await safeText(res);
+    throw new Error(`xAI stream error ${res.status}: ${msg}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() || "";
+    for (const part of parts) {
+      if (!part.startsWith("data:")) continue;
+      const data = part.slice(5).trim();
+      if (data === "[DONE]") return;
+      try {
+        const json = JSON.parse(data) as XaiChatCompletion;
+        const delta =
+          json?.choices?.[0]?.delta?.content || json?.choices?.[0]?.message?.content || "";
+        if (delta) await onChunk(delta);
+      } catch (e) {
+        console.error("stream parse error", e);
+      }
+    }
+  }
+}
+
 function buildPrompt(host: string, today: string): string {
   return `Write a reflective Markdown piece (220-400 words) for the site "${host}".
 Theme: find a simple, thoughtful meaning, metaphor, or philosophy inspired by the domain name.
@@ -223,14 +381,22 @@ function renderHtmlResponse(
   version: string,
 ): Response {
   return new Response(renderPage({ host, text, generatedAt }), {
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "public, max-age=86400",
-      etag: `${host}:${version}:${generatedAt}`,
-      "x-generated-on": generatedAt,
-      "x-md-version": version,
-    },
+    headers: htmlHeaders(host, version, generatedAt),
   });
+}
+
+function renderDailyResponse(host: string, record: DomainRecord, version: string): Response {
+  return renderHtmlResponse(host, record.text, record.generatedAt, version);
+}
+
+function htmlHeaders(host: string, version: string, generatedAt: string): HeadersInit {
+  return {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "public, max-age=86400",
+    etag: `${host}:${version}:${generatedAt}`,
+    "x-generated-on": generatedAt,
+    "x-md-version": version,
+  };
 }
 
 function renderFallbackAndCache(
@@ -247,6 +413,10 @@ function renderFallbackAndCache(
 }
 
 function wrapShell(host: string, renderedHtml: string, generatedAt: string) {
+  return `${renderShellStart(host)}${renderedHtml}${renderShellEnd(generatedAt)}`;
+}
+
+function renderShellStart(host: string) {
   const css = `
 :root { color-scheme: light dark; }
 body {
@@ -311,7 +481,11 @@ footer span, footer a { white-space: nowrap; }
   <style>${css}</style>
 </head>
 <body>
-  <pre>${renderedHtml}</pre>
+  <pre>`;
+}
+
+function renderShellEnd(generatedAt: string) {
+  return `</pre>
   <footer>
     <span>Generated on ${generatedAt}</span>
     <a href="https://steipete.me">a @steipete project</a>
@@ -350,4 +524,8 @@ function renderMarkdown(markdown: string): string {
   escaped = escaped.replace(/\*(.+?)\*/g, "<em>*$1*</em>");
   escaped = escaped.replace(/~~(.+?)~~/g, "<del>~~$1~~</del>");
   return escaped;
+}
+
+function renderMarkdownChunk(markdown: string): string {
+  return escapeHtml(markdown);
 }

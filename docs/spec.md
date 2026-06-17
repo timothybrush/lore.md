@@ -1,6 +1,6 @@
 # lore.md — Daily Markdown Per Domain (AI Gateway + xAI)
 
-Last updated: 2025-12-05 (shorter text + Grok 4.1 fast reasoning, renamed to lore.md, DO-coordinated daily generation)
+Last updated: 2025-12-05 (shorter text + Grok 4.1 fast reasoning, renamed to lore.md, DO-coordinated daily generation with streaming)
 
 Goal: Serve one markdown essay per domain per UTC day. First request generates and caches; all later requests reuse it. Style is minimal, monospace, with automatic light/dark.
 
@@ -10,7 +10,7 @@ Architecture
 - Durable Object `DomainDO` per hostname enforces single generation per day; stores `{text, generatedAt}` by version and date.
 - AI generation via Cloudflare AI Gateway (OpenAI-compatible) pointing to xAI Grok 4.1 fast reasoning.
 - Rendering: raw markdown inside `<pre>` within minimal HTML; footer shows date and project link.
-- `/stream` uses the same DO-coordinated daily path as `/`, so it cannot bypass generation coalescing.
+- Streaming: optional `/stream` path streams the first uncached generation from the Durable Object; concurrent `/` or `/stream` misses wait on the same in-flight record.
 
 Data keys
 
@@ -22,10 +22,11 @@ Request flow
 
 1. Worker tries edge cache.
 2. On miss:
-   - Call DO stub (per host) with the original host and cache version.
+   - If path ends with `/stream`, call the DO streaming endpoint. If no record exists, the DO streams AI output live, stores the completed text, and shares that in-flight generation with concurrent daily requests.
+   - Otherwise, call the DO daily endpoint with the original host and cache version.
    - DO checks storage, then awaits any in-flight generation promise for the same version/date.
    - If nothing exists or is pending, DO calls AI Gateway → xAI, saves generated or deterministic fallback text, returns JSON.
-   - Worker renders HTML and caches it.
+   - Worker renders or passes through HTML and caches it.
 
 Prompt (summary)
 
@@ -57,7 +58,7 @@ Deployment steps
 - Set env var `GATEWAY_BASE` (or edit default in code) with your real Account/Gateway IDs.
 - `wrangler deploy`; map domains/routes in Cloudflare.
 - First hit per domain per UTC day triggers generation; edge cache serves the rest.
-- `/stream` returns the same generated daily page through the same coalesced DO path.
+- Streaming: hit `/stream` on a cache miss to watch generation; final page still stores in the DO and caches for subsequent requests.
 
 CI
 

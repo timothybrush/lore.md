@@ -112,6 +112,37 @@ describe("DomainDO daily generation", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(record.text).toContain("generator blinked");
   });
+
+  it("streams the first miss while coalescing a concurrent daily miss", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          makeSseStream([
+            { choices: [{ delta: { content: "# Live" } }] },
+            { choices: [{ delta: { content: " page" } }] },
+          ]),
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const domainDO = new DomainDO(createState(), { XAI_API_KEY: "xai-key" });
+    const streamRequest = new Request("https://domain-do/stream", {
+      headers: { "x-md-host": "example.com", "x-md-version": "v15" },
+    });
+    const dailyRequest = new Request("https://domain-do/daily", {
+      headers: { "x-md-host": "example.com", "x-md-version": "v15" },
+    });
+
+    const streamResponse = await domainDO.fetch(streamRequest);
+    const dailyRecord = await domainDO.fetch(dailyRequest).then((res) => res.json());
+    const streamBody = await streamResponse.text();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(streamBody).toContain("# Live page");
+    expect(streamResponse.headers.get("content-type")).toContain("text/html");
+    expect(streamResponse.headers.get("x-generated-on")).toBe("2025-12-05");
+    expect(dailyRecord.text).toBe("# Live page");
+  });
 });
 
 describe("worker fetch", () => {
@@ -125,7 +156,7 @@ describe("worker fetch", () => {
     vi.useRealTimers();
   });
 
-  it.each(["/", "/stream"])("routes %s cold misses through the daily DO path", async (path) => {
+  it("routes normal cold misses through the daily DO path", async () => {
     const cache = createCache();
     vi.stubGlobal("caches", { default: cache });
     const doFetch = vi.fn(async () =>
@@ -135,7 +166,7 @@ describe("worker fetch", () => {
     const ctx = createContext();
 
     const response = await worker.fetch(
-      new Request(`https://example.com${path}`, { headers: { host: "example.com" } }),
+      new Request("https://example.com/", { headers: { host: "example.com" } }),
       env,
       ctx,
     );
@@ -148,6 +179,27 @@ describe("worker fetch", () => {
     expect(cache.put).toHaveBeenCalledTimes(1);
     expect(response.headers.get("x-md-version")).toBe("v15");
     expect(response.headers.get("x-generated-on")).toBe("2025-12-05");
+  });
+
+  it("routes stream cold misses through the streaming DO path", async () => {
+    const cache = createCache();
+    vi.stubGlobal("caches", { default: cache });
+    const doFetch = vi.fn(async () => new Response("<!doctype html><pre># Live page</pre>"));
+    const env = createEnv(doFetch);
+    const ctx = createContext();
+
+    const response = await worker.fetch(
+      new Request("https://example.com/stream", { headers: { host: "example.com" } }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("# Live page");
+    expect(doFetch).toHaveBeenCalledWith("https://domain-do/stream", {
+      headers: { "x-md-host": "example.com", "x-md-version": "v15" },
+    });
+    expect(cache.put).toHaveBeenCalledTimes(1);
   });
 
   it("renders and caches fallback when the DO request throws", async () => {
@@ -215,4 +267,17 @@ function createContext() {
   return {
     waitUntil: vi.fn(),
   };
+}
+
+function makeSseStream(payloads) {
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      for (const payload of payloads) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+      }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
 }
