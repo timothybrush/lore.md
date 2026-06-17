@@ -8,8 +8,8 @@ What it uses
 
 - Cloudflare Worker + Durable Object
 - Cloudflare AI Gateway (OpenAI-compatible) pointing to xAI Grok 4.1 fast reasoning
-- Edge cache 24h + stale-while-revalidate 1h
-- Optional streaming path `/stream` to show generation live on cache misses
+- Edge cache 24h
+- Durable Object request coalescing so cold misses share one daily generation
 
 Quick start
 
@@ -18,28 +18,28 @@ Quick start
 3. From repo root:
    - `wrangler secret put XAI_API_KEY`
    - optional: `wrangler secret put GATEWAY_TOKEN` if your Gateway uses a separate token
-   - set env `GATEWAY_BASE` to your compat URL (or edit the default placeholder in `src/worker.js`).
+   - set env `GATEWAY_BASE` to your compat URL (or edit the default placeholder in `src/worker.ts`).
 4. `wrangler deploy`
 5. Map your domains in Cloudflare Routes/DNS to this worker. Host header drives per-domain text.
 
 Behavior
 
-- One generation per host per UTC day; DO stores `{text, generatedAt}` with ~27h TTL.
-- Edge cache keyed per host/day; headers: `ETag` = `host:date`, `X-Generated-On` = date.
+- One generation per host per UTC day; DO stores `{text, generatedAt}` by version and date.
+- Edge cache keyed per host/version/day; headers: `ETag` = `host:version:date`, `X-Generated-On` = date.
 - Prompt: philosophical, host-aware, ~220–400 words, H1 + H2 sections, optional single bullet list, italic closing line.
-- Fallback text is deterministic if the AI call fails.
+- Fallback text is deterministic if the AI call fails, and is stored for that host/day.
 - Footer shows generation date and a right-aligned link “a @steipete project” → https://steipete.me.
-- Streaming: request `/stream` to stream the AI response when there’s no cache; the completed page is cached afterward for normal `/` hits.
+- `/stream` returns the same daily page through the same DO-coordinated path, so it cannot bypass the one-generation-per-day guard.
 
 Testing
 
 - `wrangler dev` then curl twice: `curl -H "Host: yourdomain.test" http://127.0.0.1:8787` and confirm `X-Generated-On` stays fixed.
 - Check AI Gateway analytics to verify only one upstream call per domain per day.
-- Stream test: `curl -N http://127.0.0.1:8787/stream` on a fresh day to observe live output.
+- Stream path test: `curl http://127.0.0.1:8787/stream` and confirm it returns the same daily page.
 
 Config references
 
-- `src/worker.js`: worker logic, DO class, Gateway call.
+- `src/worker.ts`: worker logic, DO class, Gateway call.
 - `wrangler.toml`: DO binding `DOMAIN_DO`, entrypoint, migration tag.
 - `docs/spec.md`: deeper architecture and ops notes.
 - CI: `.github/workflows/ci.yml` runs `wrangler deploy --dry-run` (needs GitHub secrets: `CLOUDFLARE_API_TOKEN`, `XAI_API_KEY`, and `GATEWAY_BASE`; optional `GATEWAY_TOKEN`).

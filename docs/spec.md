@@ -1,29 +1,31 @@
 # lore.md — Daily Markdown Per Domain (AI Gateway + xAI)
 
-Last updated: 2025-12-05 (shorter text + Grok 4.1 fast reasoning, renamed to lore.md, streaming path)
+Last updated: 2025-12-05 (shorter text + Grok 4.1 fast reasoning, renamed to lore.md, DO-coordinated daily generation)
 
 Goal: Serve one markdown essay per domain per UTC day. First request generates and caches; all later requests reuse it. Style is minimal, monospace, with automatic light/dark.
 
 Architecture
 
-- Cloudflare Worker handles HTTP; edge cache (`caches.default`) 24h + `stale-while-revalidate=3600`.
-- Durable Object `DomainDO` per hostname enforces single generation per day; stores `{text, generatedAt}` with ~27h TTL.
+- Cloudflare Worker handles HTTP; edge cache (`caches.default`) 24h.
+- Durable Object `DomainDO` per hostname enforces single generation per day; stores `{text, generatedAt}` by version and date.
 - AI generation via Cloudflare AI Gateway (OpenAI-compatible) pointing to xAI Grok 4.1 fast reasoning.
 - Rendering: raw markdown inside `<pre>` within minimal HTML; footer shows date and project link.
-- Streaming: optional `/stream` path streams AI output on cache miss; after completion the full page is cached.
+- `/stream` uses the same DO-coordinated daily path as `/`, so it cannot bypass generation coalescing.
 
 Data keys
 
-- DO storage key: `YYYY-MM-DD` per host (host is implied by DO instance id).
-- Edge cache key: `https://{host}/__md/{YYYY-MM-DD}`.
-- `ETag`: `{host}:{date}`; header `X-Generated-On` echoes date.
+- DO storage key: `{version}-{YYYY-MM-DD}` per host (host is implied by DO instance id).
+- Edge cache key: `https://{host}/{version}/__md/{YYYY-MM-DD}`.
+- `ETag`: `{host}:{version}:{date}`; header `X-Generated-On` echoes date.
 
 Request flow
 
 1. Worker tries edge cache.
 2. On miss:
-   - If path ends with `/stream`, stream the AI response to the client while generating, then cache the completed page.
-   - Otherwise, call DO stub (per host). DO uses `blockConcurrencyWhile`. If missing, DO calls AI Gateway → xAI, saves text with 27h TTL, returns JSON; Worker renders HTML and caches it.
+   - Call DO stub (per host) with the original host and cache version.
+   - DO checks storage, then awaits any in-flight generation promise for the same version/date.
+   - If nothing exists or is pending, DO calls AI Gateway → xAI, saves generated or deterministic fallback text, returns JSON.
+   - Worker renders HTML and caches it.
 
 Prompt (summary)
 
@@ -45,7 +47,7 @@ Styling
 Config (wrangler.toml)
 
 - Durable Object binding `DOMAIN_DO` with migration tag `v1`.
-- `main = "src/worker.js"`, `compatibility_date = "2025-12-04"`.
+- `main = "src/worker.ts"`, `compatibility_date = "2025-12-04"`.
 - Secrets: `XAI_API_KEY`; optional `GATEWAY_TOKEN`; optional `GATEWAY_BASE` (default placeholder `https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat`).
 
 Deployment steps
@@ -55,7 +57,7 @@ Deployment steps
 - Set env var `GATEWAY_BASE` (or edit default in code) with your real Account/Gateway IDs.
 - `wrangler deploy`; map domains/routes in Cloudflare.
 - First hit per domain per UTC day triggers generation; edge cache serves the rest.
-- Streaming: hit `/stream` on a cache miss to watch generation; final page still cached for subsequent requests.
+- `/stream` returns the same generated daily page through the same coalesced DO path.
 
 CI
 

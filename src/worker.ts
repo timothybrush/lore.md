@@ -39,31 +39,21 @@ export default {
 
     // 1b) Ask DO for today's text; if present, render and cache.
     const stub = env.DOMAIN_DO.get(env.DOMAIN_DO.idFromName(host));
-    const doRes = await stub.fetch("https://domain-do/internal", {
-      headers: { host, "x-md-version": version },
+    const doRes = await stub.fetch("https://domain-do/daily", {
+      headers: { "x-md-host": host, "x-md-version": version },
     });
     if (doRes.ok) {
       const payload = (await doRes.json()) as DomainRecord;
-      const html = renderPage({
-        host,
-        text: payload.text,
-        generatedAt: payload.generatedAt,
-      });
-      const response = new Response(html, {
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "public, max-age=86400, stale-while-revalidate=3600",
-          etag: `${host}:${version}:${payload.generatedAt}`,
-          "x-generated-on": payload.generatedAt,
-          "x-md-version": version,
-        },
-      });
+      const response = renderHtmlResponse(host, payload.text, payload.generatedAt, version);
       ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
       return response;
     }
 
-    // 2) Stream generation (default on cache miss); caches after completion.
-    return streamGenerate(host, today, version, env, stub, ctx);
+    // If the DO itself fails, still return a deterministic response instead of retrying forever.
+    const text = fallbackText(host, today);
+    const response = renderHtmlResponse(host, text, today, version);
+    ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
+    return response;
   },
 };
 
@@ -73,33 +63,55 @@ export { buildPrompt, fallbackText, generateDailyText, renderPage };
 export class DomainDO {
   state: DurableObjectState;
   env: Env;
+  inflight: Map<string, Promise<DomainRecord>>;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+    this.inflight = new Map();
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const today = new Date().toISOString().slice(0, 10);
     const version = request.headers.get("x-md-version") || "v1";
+    const host = request.headers.get("x-md-host") || request.headers.get("host") || "localhost";
     const key = `${version}-${today}`;
 
-    if (request.method === "POST" && url.pathname === "/store") {
-      const body = await request.json();
-      const record = {
-        text: (body as any).text as string,
-        generatedAt: (body as any).generatedAt || today,
-      };
-      await this.state.blockConcurrencyWhile(async () => {
-        await this.state.storage.put(key, record);
-      });
-      return json({ stored: true });
+    if (url.pathname === "/daily") {
+      const record = await this.getOrCreateDailyRecord(key, host, today);
+      return json(record);
     }
 
     const existing = await this.state.storage.get<any>(key);
     if (existing) return json(existing);
     return new Response("not found", { status: 404 });
+  }
+
+  private async getOrCreateDailyRecord(
+    key: string,
+    host: string,
+    today: string,
+  ): Promise<DomainRecord> {
+    const existing = await this.state.storage.get<DomainRecord>(key);
+    if (existing) return existing;
+
+    const pending = this.inflight.get(key);
+    if (pending) return pending;
+
+    const promise = (async () => {
+      const text = await generateDailyText(this.env, host, today);
+      const record = { text, generatedAt: today };
+      await this.state.storage.put(key, record);
+      return record;
+    })();
+
+    this.inflight.set(key, promise);
+    try {
+      return await promise;
+    } finally {
+      this.inflight.delete(key);
+    }
   }
 }
 
@@ -157,74 +169,6 @@ async function callXai(env: Env, prompt: string): Promise<string> {
   return text;
 }
 
-async function callXaiStream(
-  env: Env,
-  prompt: string,
-  onChunk: (chunk: string) => Promise<void> | void,
-): Promise<void> {
-  if (!env.XAI_API_KEY) {
-    throw new Error("XAI_API_KEY is not set");
-  }
-  const apiBase =
-    env.GATEWAY_BASE || "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat";
-  const body = {
-    model: "grok-4-1-fast-reasoning",
-    messages: [
-      {
-        role: "system",
-        content:
-          "You write concise, thoughtful Markdown essays. No HTML. No images. Do not mention the prompt itself.",
-      },
-      { role: "user", content: prompt },
-    ],
-    temperature: 0.6,
-    top_p: 0.9,
-    max_tokens: 500,
-    stream: true,
-  };
-
-  const res = await fetch(`${apiBase}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${env.GATEWAY_TOKEN || env.XAI_API_KEY}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok || !res.body) {
-    const msg = await safeText(res);
-    throw new Error(`xAI stream error ${res.status}: ${msg}`);
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() || "";
-    for (const part of parts) {
-      if (!part.startsWith("data:")) continue;
-      const data = part.slice(5).trim();
-      if (data === "[DONE]") {
-        return;
-      }
-      try {
-        const json = JSON.parse(data) as XaiChatCompletion;
-        const delta =
-          json?.choices?.[0]?.delta?.content || json?.choices?.[0]?.message?.content || "";
-        if (delta) await onChunk(delta);
-      } catch (e) {
-        console.error("stream parse error", e);
-      }
-    }
-  }
-}
-
 function buildPrompt(host: string, today: string): string {
   return `Write a reflective Markdown piece (220-400 words) for the site "${host}".
 Theme: find a simple, thoughtful meaning, metaphor, or philosophy inspired by the domain name.
@@ -249,79 +193,6 @@ Until it wakes, take this small reminder: meaning often shows up after the first
 _Generated on ${today} UTC; cached until the next sunrise._`;
 }
 
-async function streamGenerate(
-  host: string,
-  today: string,
-  version: string,
-  env: Env,
-  stub: DurableObjectStub,
-  ctx: ExecutionContext,
-): Promise<Response> {
-  const prompt = buildPrompt(host, today);
-  const ts = new TransformStream();
-  const writer = ts.writable.getWriter();
-  const encoder = new TextEncoder();
-
-  const response = new Response(ts.readable, {
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "transfer-encoding": "chunked",
-      "x-md-version": version,
-    },
-  });
-
-  ctx.waitUntil(
-    (async () => {
-      let collected = "";
-      const collect = async (chunk: string) => {
-        collected += chunk;
-      };
-
-      try {
-        await callXaiStream(env, prompt, collect);
-
-        const rendered = renderMarkdown(collected.trim());
-        const body = `${renderHead(host)}${rendered}${renderFooter(today)}`;
-        await writer.write(encoder.encode(body));
-
-        if (collected.trim().length && stub) {
-          await stub.fetch("https://domain-do/store", {
-            method: "POST",
-            headers: {
-              host,
-              "content-type": "application/json",
-              "x-md-version": version,
-            },
-            body: JSON.stringify({ text: collected, generatedAt: today }),
-          });
-        }
-
-        if (collected.trim().length) {
-          const html = wrapShell(host, renderMarkdown(collected.trim()), today);
-          const cacheKey = new Request(`https://${host}/${version}/__md/${today}`);
-          const cachedResponse = new Response(html, {
-            headers: {
-              "content-type": "text/html; charset=utf-8",
-              "cache-control": "public, max-age=86400, stale-while-revalidate=3600",
-              etag: `${host}:${version}:${today}`,
-              "x-generated-on": today,
-              "x-md-version": version,
-            },
-          });
-          await caches.default.put(cacheKey, cachedResponse);
-        }
-      } catch (err) {
-        console.error("stream error", err);
-        await writer.write(encoder.encode("\n\n<p><em>generation failed</em></p>"));
-      } finally {
-        await writer.close();
-      }
-    })(),
-  );
-
-  return response;
-}
-
 function renderPage({
   host,
   text,
@@ -333,6 +204,23 @@ function renderPage({
 }) {
   const rendered = renderMarkdown(text);
   return wrapShell(host, rendered, generatedAt);
+}
+
+function renderHtmlResponse(
+  host: string,
+  text: string,
+  generatedAt: string,
+  version: string,
+): Response {
+  return new Response(renderPage({ host, text, generatedAt }), {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=86400",
+      etag: `${host}:${version}:${generatedAt}`,
+      "x-generated-on": generatedAt,
+      "x-md-version": version,
+    },
+  });
 }
 
 function wrapShell(host: string, renderedHtml: string, generatedAt: string) {
@@ -430,74 +318,6 @@ async function safeText(res: Response): Promise<string> {
   } catch {
     return "<no-body>";
   }
-}
-
-function renderHead(host: string): string {
-  const css = `
-:root { color-scheme: light dark; }
-body {
-  font: 16px/1.6 "IBM Plex Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  max-width: 72ch;
-  margin: 8vh auto 10vh;
-  padding: 0 1.5rem;
-  background: var(--bg, #f8f8f5);
-  color: var(--fg, #111);
-  -webkit-font-smoothing: antialiased;
-}
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #0c0c0c; --fg: #e6e6e6; }
-}
-@media (prefers-color-scheme: light) {
-  :root { --bg: #f8f8f5; --fg: #111; }
-}
-pre {
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  margin: 0;
-}
-footer {
-  margin-top: 2.5rem;
-  font-size: 12px;
-  letter-spacing: 0.02em;
-  opacity: 0.7;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 1rem;
-}
-footer a {
-  color: inherit;
-  text-decoration: none;
-}
-.strong-italic {
-  font-style: italic;
-  font-weight: 600;
-}
-p { margin: 0.3rem 0 0.6rem; }
-@media (max-width: 520px) {
-  footer { flex-direction: column; align-items: flex-start; }
-}
-`;
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(host)}</title>
-  <style>${css}</style>
-</head>
-<body>
-  <pre>`;
-}
-
-function renderFooter(generatedAt: string): string {
-  return `</pre>
-  <footer>
-    <span>Generated on ${generatedAt} UTC</span>
-    <a href="https://steipete.me" target="_blank" rel="noopener">a @steipete project</a>
-  </footer>
-</body>
-</html>`;
 }
 
 function renderMarkdown(markdown: string): string {
