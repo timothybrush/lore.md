@@ -211,14 +211,18 @@ export class DomainDO {
   ): Promise<DomainRecord> {
     let collected = "";
     let streamOpen = true;
-    const write = async (html: string) => {
+    let writeChain = Promise.resolve();
+    const write = (html: string) => {
       if (!streamOpen) return;
-      try {
-        await writer.write(encoder.encode(html));
-      } catch (err) {
-        streamOpen = false;
-        console.error("stream write error", err);
-      }
+      writeChain = writeChain.then(async () => {
+        if (!streamOpen) return;
+        try {
+          await writer.write(encoder.encode(html));
+        } catch (err) {
+          streamOpen = false;
+          console.error("stream write error", err);
+        }
+      });
     };
     const closeStream = async () => {
       if (!streamOpen) return;
@@ -239,12 +243,12 @@ export class DomainDO {
       }
     };
 
-    await write(renderShellStart(host));
+    write(renderShellStart(host));
     let record: DomainRecord;
     try {
-      await callXaiStream(this.env, buildPrompt(host, today), async (chunk) => {
+      await callXaiStream(this.env, buildPrompt(host, today), (chunk) => {
         collected += chunk;
-        await write(renderMarkdownChunk(chunk));
+        write(renderMarkdownChunk(chunk));
       });
 
       const text = collected.trim();
@@ -255,9 +259,9 @@ export class DomainDO {
       const fallback = fallbackText(host, today);
       record = { text: fallback, generatedAt: today };
       if (!collected.trim()) {
-        await write(renderMarkdownChunk(fallback));
+        write(renderMarkdownChunk(fallback));
       } else {
-        await write(
+        write(
           renderMarkdownChunk(
             "\n\n_Generation interrupted; the saved daily page uses fallback text._",
           ),
@@ -272,8 +276,8 @@ export class DomainDO {
       throw err;
     }
 
-    await write(renderShellEnd(today));
-    await closeStream();
+    write(renderShellEnd(today));
+    void writeChain.then(closeStream);
     return record;
   }
 }

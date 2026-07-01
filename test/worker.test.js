@@ -170,6 +170,33 @@ describe("DomainDO daily generation", () => {
     expect(dailyRecord.text).toBe("# Live page");
   });
 
+  it("stores the daily record when the first stream client does not read", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          makeSseStream([
+            { choices: [{ delta: { content: "# Unread" } }] },
+            { choices: [{ delta: { content: " page" } }] },
+          ]),
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const domainDO = new DomainDO(createState(), { XAI_API_KEY: "xai-key" });
+    const headers = { "x-md-host": "example.com", "x-md-version": "v15" };
+    const streamResponse = await domainDO.fetch(
+      new Request("https://domain-do/stream", { headers }),
+    );
+
+    const dailyRecord = await domainDO
+      .fetch(new Request("https://domain-do/daily", { headers }))
+      .then((res) => res.json());
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(dailyRecord.text).toBe("# Unread page");
+    await streamResponse.body.cancel();
+  });
+
   it("stores fallback instead of partial output after a midstream failure", async () => {
     const fetchMock = vi.fn(
       async () =>
