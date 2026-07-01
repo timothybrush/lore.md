@@ -163,6 +163,8 @@ export class DomainDO {
     const writer = stream.writable.getWriter();
     const encoder = new TextEncoder();
 
+    // Pending I/O keeps a Durable Object alive without waitUntil. Keep canonical
+    // generation detached from response backpressure so peers can await it.
     const promise = this.generateStreamedRecord(storageKey, host, today, writer, encoder);
     this.inflight.set(inflightKey, promise);
     void promise.then(
