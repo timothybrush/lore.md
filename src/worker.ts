@@ -44,17 +44,32 @@ export default {
       const doRes = await stub.fetch(`https://domain-do${doPath}`, {
         headers: { "x-md-host": host, "x-md-version": version },
       });
-      if (doRes.ok) {
-        const response =
-          doPath === "/stream" ? doRes : renderDailyResponse(host, await doRes.json(), version);
-        ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
-        return response;
+      if (!doRes.ok) {
+        throw new Error(`DO daily request failed with ${doRes.status}`);
       }
+
+      // A live stream is not cacheable because its canonical record is unknown
+      // until generation and Durable Object storage both complete.
+      if (doPath === "/stream") return doRes;
+
+      const record = await doRes.json();
+      if (!isDomainRecord(record, today)) {
+        throw new Error("DO daily response was malformed or stale");
+      }
+      const response = renderDailyResponse(host, record, version);
+      ctx.waitUntil(
+        caches.default
+          .put(cacheKey, response.clone())
+          .catch((err) => console.error("edge cache write error", err)),
+      );
+      return response;
     } catch (err) {
-      console.error("DO daily lookup error", err);
+      console.error("DO daily request error", err);
     }
 
-    return renderFallbackAndCache(host, today, version, cacheKey, ctx);
+    // Do not cache a Worker-local fallback: the DO request may have failed after
+    // successfully starting generation, and its stored record remains canonical.
+    return renderUncachedFallback(host, today, version);
   },
 };
 
@@ -77,58 +92,68 @@ export class DomainDO {
     const today = new Date().toISOString().slice(0, 10);
     const version = request.headers.get("x-md-version") || "v1";
     const host = request.headers.get("x-md-host") || request.headers.get("host") || "localhost";
-    const key = `${version}-${today}`;
+    const inflightKey = `${version}-${today}`;
+    const storageKey = `${version}-daily`;
+    const legacyKey = `${version}-${today}`;
 
     if (url.pathname === "/daily") {
-      const record = await this.getOrCreateDailyRecord(key, host, today);
+      const record = await this.getOrCreateDailyRecord(
+        inflightKey,
+        storageKey,
+        legacyKey,
+        host,
+        today,
+      );
       return json(record);
     }
 
     if (url.pathname === "/stream") {
-      return this.streamDailyRecord(key, host, today, version);
+      return this.streamDailyRecord(inflightKey, storageKey, legacyKey, host, today, version);
     }
 
-    const existing = await this.state.storage.get<any>(key);
-    if (existing) return json(existing);
     return new Response("not found", { status: 404 });
   }
 
   private async getOrCreateDailyRecord(
-    key: string,
+    inflightKey: string,
+    storageKey: string,
+    legacyKey: string,
     host: string,
     today: string,
   ): Promise<DomainRecord> {
-    const existing = await this.state.storage.get<DomainRecord>(key);
+    const existing = await this.getStoredDailyRecord(storageKey, legacyKey, today);
     if (existing) return existing;
 
-    const pending = this.inflight.get(key);
+    const pending = this.inflight.get(inflightKey);
     if (pending) return pending;
 
     const promise = (async () => {
       const text = await generateDailyText(this.env, host, today);
       const record = { text, generatedAt: today };
-      await this.state.storage.put(key, record);
+      await this.state.storage.put(storageKey, record);
       return record;
     })();
 
-    this.inflight.set(key, promise);
+    this.inflight.set(inflightKey, promise);
     try {
       return await promise;
     } finally {
-      this.inflight.delete(key);
+      this.inflight.delete(inflightKey);
     }
   }
 
   private async streamDailyRecord(
-    key: string,
+    inflightKey: string,
+    storageKey: string,
+    legacyKey: string,
     host: string,
     today: string,
     version: string,
   ): Promise<Response> {
-    const existing = await this.state.storage.get<DomainRecord>(key);
+    const existing = await this.getStoredDailyRecord(storageKey, legacyKey, today);
     if (existing) return renderHtmlResponse(host, existing.text, existing.generatedAt, version);
 
-    const pending = this.inflight.get(key);
+    const pending = this.inflight.get(inflightKey);
     if (pending) {
       const record = await pending;
       return renderHtmlResponse(host, record.text, record.generatedAt, version);
@@ -138,64 +163,112 @@ export class DomainDO {
     const writer = stream.writable.getWriter();
     const encoder = new TextEncoder();
 
-    const promise = this.generateStreamedRecord(key, host, today, writer, encoder);
-    this.inflight.set(key, promise);
-    void promise.finally(() => this.inflight.delete(key));
+    const promise = this.generateStreamedRecord(storageKey, host, today, writer, encoder);
+    this.inflight.set(inflightKey, promise);
+    void promise.then(
+      () => this.inflight.delete(inflightKey),
+      (err) => {
+        this.inflight.delete(inflightKey);
+        console.error("streamed daily generation failed", err);
+      },
+    );
 
     return new Response(stream.readable, {
-      headers: htmlHeaders(host, version, today),
+      headers: streamHeaders(version, today),
     });
   }
 
+  private async getStoredDailyRecord(
+    storageKey: string,
+    legacyKey: string,
+    today: string,
+  ): Promise<DomainRecord | undefined> {
+    const current = await this.state.storage.get<DomainRecord>(storageKey);
+    if (isDomainRecord(current, today)) return current;
+
+    // Main previously stored records under version/date keys. Migrate today's
+    // observed production state once, then overwrite one bounded daily slot.
+    const legacy = await this.state.storage.get<DomainRecord>(legacyKey);
+    if (!isDomainRecord(legacy, today)) return undefined;
+
+    await this.state.storage.put(storageKey, legacy);
+    await this.state.storage.delete(legacyKey);
+    return legacy;
+  }
+
   private async generateStreamedRecord(
-    key: string,
+    storageKey: string,
     host: string,
     today: string,
     writer: WritableStreamDefaultWriter<Uint8Array>,
     encoder: TextEncoder,
   ): Promise<DomainRecord> {
     let collected = "";
-    let writeQueue = Promise.resolve();
-    const enqueue = (html: string) => {
-      writeQueue = writeQueue
-        .then(() => writer.write(encoder.encode(html)))
-        .catch((err) => console.error("stream write error", err));
+    let streamOpen = true;
+    const write = async (html: string) => {
+      if (!streamOpen) return;
+      try {
+        await writer.write(encoder.encode(html));
+      } catch (err) {
+        streamOpen = false;
+        console.error("stream write error", err);
+      }
     };
-    const closeStream = () => {
-      void writeQueue
-        .then(() => writer.close())
-        .catch((err) => console.error("stream close error", err));
+    const closeStream = async () => {
+      if (!streamOpen) return;
+      streamOpen = false;
+      try {
+        await writer.close();
+      } catch (err) {
+        console.error("stream close error", err);
+      }
+    };
+    const abortStream = async (reason: unknown) => {
+      if (!streamOpen) return;
+      streamOpen = false;
+      try {
+        await writer.abort(reason);
+      } catch (err) {
+        console.error("stream abort error", err);
+      }
     };
 
+    await write(renderShellStart(host));
+    let record: DomainRecord;
     try {
-      enqueue(renderShellStart(host));
       await callXaiStream(this.env, buildPrompt(host, today), async (chunk) => {
         collected += chunk;
-        enqueue(renderMarkdownChunk(chunk));
+        await write(renderMarkdownChunk(chunk));
       });
 
       const text = collected.trim();
-      const finalText = text || fallbackText(host, today);
-      if (!text) {
-        enqueue(renderMarkdownChunk(finalText));
-      }
-      const record = { text: finalText, generatedAt: today };
-      await this.state.storage.put(key, record);
-      enqueue(renderShellEnd(today));
-      closeStream();
-      return record;
+      if (!text) throw new Error("xAI stream response missing content");
+      record = { text, generatedAt: today };
     } catch (err) {
       console.error("AI stream generation error", err);
       const fallback = fallbackText(host, today);
-      const record = { text: fallback, generatedAt: today };
-      await this.state.storage.put(key, record);
+      record = { text: fallback, generatedAt: today };
       if (!collected.trim()) {
-        enqueue(renderMarkdownChunk(fallback));
+        await write(renderMarkdownChunk(fallback));
+      } else {
+        await write(
+          renderMarkdownChunk(
+            "\n\n_Generation interrupted; the saved daily page uses fallback text._",
+          ),
+        );
       }
-      enqueue(renderShellEnd(today));
-      closeStream();
-      return record;
     }
+
+    try {
+      await this.state.storage.put(storageKey, record);
+    } catch (err) {
+      await abortStream(err);
+      throw err;
+    }
+
+    await write(renderShellEnd(today));
+    await closeStream();
+    return record;
   }
 }
 
@@ -237,9 +310,8 @@ async function callXai(env: Env, prompt: string): Promise<string> {
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
-  let res: Response;
   try {
-    res = await fetch(`${apiBase}/chat/completions`, {
+    const res = await fetch(`${apiBase}/chat/completions`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -248,19 +320,19 @@ async function callXai(env: Env, prompt: string): Promise<string> {
       body: JSON.stringify(body),
       signal: controller.signal,
     });
+
+    if (!res.ok) {
+      const msg = await safeText(res);
+      throw new Error(`xAI error ${res.status}: ${msg}`);
+    }
+
+    const data = (await res.json()) as XaiChatCompletion;
+    const text = data?.choices?.[0]?.message?.content || data?.output_text || data?.response;
+    if (!text) throw new Error("xAI response missing content");
+    return text;
   } finally {
     clearTimeout(timeout);
   }
-
-  if (!res.ok) {
-    const msg = await safeText(res);
-    throw new Error(`xAI error ${res.status}: ${msg}`);
-  }
-
-  const data = (await res.json()) as XaiChatCompletion;
-  const text = data?.choices?.[0]?.message?.content || data?.output_text || data?.response;
-  if (!text) throw new Error("xAI response missing content");
-  return text;
 }
 
 async function callXaiStream(
@@ -291,9 +363,8 @@ async function callXaiStream(
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
-  let res: Response;
   try {
-    res = await fetch(`${apiBase}/chat/completions`, {
+    const res = await fetch(`${apiBase}/chat/completions`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -302,38 +373,54 @@ async function callXaiStream(
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-  } finally {
-    clearTimeout(timeout);
-  }
 
-  if (!res.ok || !res.body) {
-    const msg = await safeText(res);
-    throw new Error(`xAI stream error ${res.status}: ${msg}`);
-  }
+    if (!res.ok || !res.body) {
+      const msg = await safeText(res);
+      throw new Error(`xAI stream error ${res.status}: ${msg}`);
+    }
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() || "";
-    for (const part of parts) {
-      if (!part.startsWith("data:")) continue;
-      const data = part.slice(5).trim();
-      if (data === "[DONE]") return;
+    const processEvent = async (event: string): Promise<boolean> => {
+      const data = event
+        .split("\n")
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n")
+        .trim();
+      if (!data) return false;
+      if (data === "[DONE]") return true;
+
       try {
         const json = JSON.parse(data) as XaiChatCompletion;
         const delta =
           json?.choices?.[0]?.delta?.content || json?.choices?.[0]?.message?.content || "";
         if (delta) await onChunk(delta);
       } catch (e) {
-        console.error("stream parse error", e);
+        throw new Error("xAI stream contained malformed JSON", { cause: e });
+      }
+      return false;
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      buffer = buffer.replace(/\r\n?/g, "\n");
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+      for (const part of parts) {
+        if (await processEvent(part)) return;
       }
     }
+
+    buffer += decoder.decode();
+    if (buffer.trim() && (await processEvent(buffer))) return;
+    throw new Error("xAI stream ended before [DONE]");
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -399,17 +486,30 @@ function htmlHeaders(host: string, version: string, generatedAt: string): Header
   };
 }
 
-function renderFallbackAndCache(
-  host: string,
-  today: string,
-  version: string,
-  cacheKey: Request,
-  ctx: ExecutionContext,
-): Response {
+function streamHeaders(version: string, generatedAt: string): HeadersInit {
+  return {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "x-generated-on": generatedAt,
+    "x-md-version": version,
+  };
+}
+
+function renderUncachedFallback(host: string, today: string, version: string): Response {
   const text = fallbackText(host, today);
-  const response = renderHtmlResponse(host, text, today, version);
-  ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
-  return response;
+  const headers = new Headers(htmlHeaders(host, version, today));
+  headers.set("cache-control", "no-store");
+  return new Response(renderPage({ host, text, generatedAt: today }), { headers });
+}
+
+function isDomainRecord(value: unknown, expectedDate: string): value is DomainRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Partial<DomainRecord>;
+  return (
+    typeof record.text === "string" &&
+    record.text.trim().length > 0 &&
+    record.generatedAt === expectedDate
+  );
 }
 
 function wrapShell(host: string, renderedHtml: string, generatedAt: string) {

@@ -134,14 +134,102 @@ describe("DomainDO daily generation", () => {
     });
 
     const streamResponse = await domainDO.fetch(streamRequest);
+    const streamBodyPromise = streamResponse.text();
     const dailyRecord = await domainDO.fetch(dailyRequest).then((res) => res.json());
-    const streamBody = await streamResponse.text();
+    const streamBody = await streamBodyPromise;
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(streamBody).toContain("# Live page");
     expect(streamResponse.headers.get("content-type")).toContain("text/html");
     expect(streamResponse.headers.get("x-generated-on")).toBe("2025-12-05");
     expect(dailyRecord.text).toBe("# Live page");
+  });
+
+  it("stores fallback instead of partial output after a midstream failure", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(makeFailingSseStream({ choices: [{ delta: { content: "# Partial page" } }] })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const domainDO = new DomainDO(createState(), { XAI_API_KEY: "xai-key" });
+    const headers = { "x-md-host": "example.com", "x-md-version": "v15" };
+    const streamResponse = await domainDO.fetch(
+      new Request("https://domain-do/stream", { headers }),
+    );
+    const streamBody = await streamResponse.text();
+    const dailyRecord = await domainDO
+      .fetch(new Request("https://domain-do/daily", { headers }))
+      .then((res) => res.json());
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(streamBody).toContain("# Partial page");
+    expect(streamBody).toContain("Generation interrupted");
+    expect(dailyRecord.text).toContain("generator blinked");
+    expect(dailyRecord.text).not.toContain("# Partial page");
+  });
+
+  it("rejects a cleanly truncated SSE response without a done marker", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(makeSseStream([{ choices: [{ delta: { content: "# Truncated" } }] }], false)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const domainDO = new DomainDO(createState(), { XAI_API_KEY: "xai-key" });
+    const headers = { "x-md-host": "example.com", "x-md-version": "v15" };
+    const streamResponse = await domainDO.fetch(
+      new Request("https://domain-do/stream", { headers }),
+    );
+    await streamResponse.text();
+    const dailyRecord = await domainDO
+      .fetch(new Request("https://domain-do/daily", { headers }))
+      .then((res) => res.json());
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(dailyRecord.text).toContain("generator blinked");
+    expect(dailyRecord.text).not.toContain("# Truncated");
+  });
+
+  it("overwrites one bounded storage slot on the next UTC day", async () => {
+    const fetchMock = vi.fn(async () =>
+      Response.json({
+        choices: [{ message: { content: `# Page ${fetchMock.mock.calls.length}` } }],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const state = createState();
+    const domainDO = new DomainDO(state, { XAI_API_KEY: "xai-key" });
+    const request = new Request("https://domain-do/daily", {
+      headers: { "x-md-host": "example.com", "x-md-version": "v15" },
+    });
+
+    await domainDO.fetch(request);
+    vi.setSystemTime(new Date("2025-12-06T12:00:00Z"));
+    await domainDO.fetch(request);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect([...state.values.keys()]).toEqual(["v15-daily"]);
+    expect(state.values.get("v15-daily").generatedAt).toBe("2025-12-06");
+  });
+
+  it("migrates today's legacy version-date record without regenerating", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const record = { text: "# Existing page", generatedAt: "2025-12-05" };
+    const state = createState([["v15-2025-12-05", record]]);
+    const domainDO = new DomainDO(state, { XAI_API_KEY: "xai-key" });
+
+    const response = await domainDO.fetch(
+      new Request("https://domain-do/daily", {
+        headers: { "x-md-host": "example.com", "x-md-version": "v15" },
+      }),
+    );
+
+    expect(await response.json()).toEqual(record);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect([...state.values.entries()]).toEqual([["v15-daily", record]]);
   });
 });
 
@@ -199,7 +287,7 @@ describe("worker fetch", () => {
     expect(doFetch).toHaveBeenCalledWith("https://domain-do/stream", {
       headers: { "x-md-host": "example.com", "x-md-version": "v15" },
     });
-    expect(cache.put).toHaveBeenCalledTimes(1);
+    expect(cache.put).not.toHaveBeenCalled();
   });
 
   it("renders and caches fallback when the DO request throws", async () => {
@@ -215,7 +303,8 @@ describe("worker fetch", () => {
 
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("generator blinked");
-    expect(cache.put).toHaveBeenCalledTimes(1);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(cache.put).not.toHaveBeenCalled();
   });
 
   it("renders and caches fallback when the DO response is malformed", async () => {
@@ -229,19 +318,22 @@ describe("worker fetch", () => {
 
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("generator blinked");
-    expect(cache.put).toHaveBeenCalledTimes(1);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(cache.put).not.toHaveBeenCalled();
   });
 });
 
-function createState() {
-  const values = new Map();
+function createState(entries = []) {
+  const values = new Map(entries);
 
   return {
+    values,
     storage: {
       get: vi.fn(async (key) => values.get(key)),
       put: vi.fn(async (key, value) => {
         values.set(key, value);
       }),
+      delete: vi.fn(async (key) => values.delete(key)),
     },
   };
 }
@@ -269,15 +361,30 @@ function createContext() {
   };
 }
 
-function makeSseStream(payloads) {
+function makeSseStream(payloads, includeDone = true) {
   const encoder = new TextEncoder();
   return new ReadableStream({
     start(controller) {
       for (const payload of payloads) {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
       }
-      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      if (includeDone) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       controller.close();
+    },
+  });
+}
+
+function makeFailingSseStream(payload) {
+  const encoder = new TextEncoder();
+  let sentChunk = false;
+  return new ReadableStream({
+    pull(controller) {
+      if (!sentChunk) {
+        sentChunk = true;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+        return;
+      }
+      controller.error(new Error("upstream stream failed"));
     },
   });
 }

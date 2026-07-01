@@ -7,14 +7,14 @@ Goal: Serve one markdown essay per domain per UTC day. First request generates a
 Architecture
 
 - Cloudflare Worker handles HTTP; edge cache (`caches.default`) 24h.
-- Durable Object `DomainDO` per hostname enforces single generation per day; stores `{text, generatedAt}` by version and date.
+- Durable Object `DomainDO` per hostname enforces single generation per day; stores `{text, generatedAt}` in one overwritten slot per cache version.
 - AI generation via Cloudflare AI Gateway (OpenAI-compatible) pointing to xAI Grok 4.1 fast reasoning.
 - Rendering: raw markdown inside `<pre>` within minimal HTML; footer shows date and project link.
 - Streaming: optional `/stream` path streams the first uncached generation from the Durable Object; concurrent `/` or `/stream` misses wait on the same in-flight record.
 
 Data keys
 
-- DO storage key: `{version}-{YYYY-MM-DD}` per host (host is implied by DO instance id).
+- DO storage key: `{version}-daily` per host (host is implied by DO instance id); the record date decides whether it is current. Today's legacy `{version}-{YYYY-MM-DD}` record is migrated on first read.
 - Edge cache key: `https://{host}/{version}/__md/{YYYY-MM-DD}`.
 - `ETag`: `{host}:{version}:{date}`; header `X-Generated-On` echoes date.
 
@@ -22,11 +22,11 @@ Request flow
 
 1. Worker tries edge cache.
 2. On miss:
-   - If path ends with `/stream`, call the DO streaming endpoint. If no record exists, the DO streams AI output live, stores the completed text, and shares that in-flight generation with concurrent daily requests.
+   - If path is `/stream`, call the DO streaming endpoint. If no record exists, the DO streams AI output live, stores the completed text, and shares that in-flight generation with concurrent daily requests. The live response is not edge-cached because it is not canonical until both generation and DO storage finish.
    - Otherwise, call the DO daily endpoint with the original host and cache version.
    - DO checks storage, then awaits any in-flight generation promise for the same version/date.
    - If nothing exists or is pending, DO calls AI Gateway → xAI, saves generated or deterministic fallback text, returns JSON.
-   - Worker renders or passes through HTML and caches it.
+   - Worker renders and edge-caches completed `/daily` records. A normal request after a live stream populates that data center's edge cache.
 
 Prompt (summary)
 
@@ -36,7 +36,7 @@ Prompt (summary)
 
 Failure mode
 
-- On AI error/empty response, deterministic fallback markdown is returned and cached for the day.
+- On AI error, empty output, malformed/truncated SSE, or timeout, deterministic fallback markdown is stored as the daily record. A partially delivered live stream is marked interrupted and never edge-cached. Worker-local fallback for a failed DO request is `no-store`, avoiding divergence from a generation that may still finish inside the DO.
 
 Styling
 

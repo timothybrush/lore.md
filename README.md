@@ -25,12 +25,12 @@ Quick start
 
 Behavior
 
-- One generation per host per UTC day; DO stores `{text, generatedAt}` by version and date.
+- One generation per host per UTC day; DO overwrites one `{text, generatedAt}` slot per cache version.
 - Edge cache keyed per host/version/day; headers: `ETag` = `host:version:date`, `X-Generated-On` = date.
 - Prompt: philosophical, host-aware, ~220–400 words, H1 + H2 sections, optional single bullet list, italic closing line.
 - Fallback text is deterministic if the AI call fails, and is stored for that host/day.
 - Footer shows generation date and a right-aligned link “a @steipete project” → https://steipete.me.
-- Streaming: request `/stream` to stream the first uncached generation live through the Durable Object. Concurrent `/` or `/stream` misses wait on the same in-flight generation, so streaming cannot bypass the one-generation-per-day guard.
+- Streaming: request `/stream` to stream the first uncached generation live through the Durable Object. Concurrent `/` or `/stream` misses wait on the same in-flight generation, so streaming cannot bypass the one-generation-per-day guard. Live responses are not edge-cached; the next normal request caches the completed DO record. Interrupted streams store deterministic fallback text, never partial output, as the daily record.
 
 Testing
 
