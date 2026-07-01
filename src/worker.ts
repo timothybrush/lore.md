@@ -130,7 +130,7 @@ export class DomainDO {
     const promise = (async () => {
       const text = await generateDailyText(this.env, host, today);
       const record = { text, generatedAt: today };
-      await this.state.storage.put(storageKey, record);
+      await this.storeDailyRecord(storageKey, record);
       return record;
     })();
 
@@ -191,9 +191,15 @@ export class DomainDO {
     const legacy = await this.state.storage.get<DomainRecord>(legacyKey);
     if (!isDomainRecord(legacy, today)) return undefined;
 
-    await this.state.storage.put(storageKey, legacy);
+    await this.storeDailyRecord(storageKey, legacy);
     await this.state.storage.delete(legacyKey);
     return legacy;
+  }
+
+  private async storeDailyRecord(storageKey: string, record: DomainRecord): Promise<void> {
+    const current = await this.state.storage.get<DomainRecord>(storageKey);
+    if (isStoredDomainRecord(current) && current.generatedAt > record.generatedAt) return;
+    await this.state.storage.put(storageKey, record);
   }
 
   private async generateStreamedRecord(
@@ -260,7 +266,7 @@ export class DomainDO {
     }
 
     try {
-      await this.state.storage.put(storageKey, record);
+      await this.storeDailyRecord(storageKey, record);
     } catch (err) {
       await abortStream(err);
       throw err;
@@ -510,12 +516,17 @@ function renderUncachedFallback(host: string, today: string, version: string): R
 }
 
 function isDomainRecord(value: unknown, expectedDate: string): value is DomainRecord {
+  return isStoredDomainRecord(value) && value.generatedAt === expectedDate;
+}
+
+function isStoredDomainRecord(value: unknown): value is DomainRecord {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Partial<DomainRecord>;
   return (
     typeof record.text === "string" &&
     record.text.trim().length > 0 &&
-    record.generatedAt === expectedDate
+    typeof record.generatedAt === "string" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(record.generatedAt)
   );
 }
 

@@ -239,6 +239,42 @@ describe("DomainDO daily generation", () => {
     expect(state.values.get("v15-daily").generatedAt).toBe("2025-12-06");
   });
 
+  it("does not let a slow previous-day generation overwrite the new day", async () => {
+    vi.setSystemTime(new Date("2025-12-05T23:59:59Z"));
+    const oldDay = createDeferred();
+    const newDay = createDeferred();
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(() => oldDay.promise)
+      .mockImplementationOnce(() => newDay.promise);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const state = createState();
+    const domainDO = new DomainDO(state, { XAI_API_KEY: "xai-key" });
+    const request = new Request("https://domain-do/daily", {
+      headers: { "x-md-host": "example.com", "x-md-version": "v15" },
+    });
+
+    const oldRecordPromise = domainDO.fetch(request).then((res) => res.json());
+    await flushPromises();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(new Date("2025-12-06T00:00:01Z"));
+    const newRecordPromise = domainDO.fetch(request).then((res) => res.json());
+    await flushPromises();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    newDay.resolve(Response.json({ choices: [{ message: { content: "# New day" } }] }));
+    expect((await newRecordPromise).text).toBe("# New day");
+
+    oldDay.resolve(Response.json({ choices: [{ message: { content: "# Old day" } }] }));
+    expect((await oldRecordPromise).text).toBe("# Old day");
+
+    const current = await domainDO.fetch(request).then((res) => res.json());
+    expect(current).toEqual({ text: "# New day", generatedAt: "2025-12-06" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("migrates today's legacy version-date record without regenerating", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -412,4 +448,16 @@ function makeFailingSseStream(payload) {
       controller.error(new Error("upstream stream failed"));
     },
   });
+}
+
+function createDeferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+async function flushPromises() {
+  for (let index = 0; index < 10; index += 1) await Promise.resolve();
 }
