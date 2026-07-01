@@ -74,7 +74,7 @@ export default {
 };
 
 // Export helpers for testing.
-export { buildPrompt, fallbackText, generateDailyText, renderPage };
+export { buildGatewayHeaders, buildPrompt, fallbackText, generateDailyText, renderPage };
 
 export class DomainDO {
   state: DurableObjectState;
@@ -313,10 +313,7 @@ async function callXai(env: Env, prompt: string): Promise<string> {
   try {
     const res = await fetch(`${apiBase}/chat/completions`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${env.GATEWAY_TOKEN || env.XAI_API_KEY}`,
-      },
+      headers: buildGatewayHeaders(env),
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -366,10 +363,7 @@ async function callXaiStream(
   try {
     const res = await fetch(`${apiBase}/chat/completions`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${env.GATEWAY_TOKEN || env.XAI_API_KEY}`,
-      },
+      headers: buildGatewayHeaders(env),
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -422,6 +416,19 @@ async function callXaiStream(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function buildGatewayHeaders(env: Env): Record<string, string> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    authorization: `Bearer ${env.XAI_API_KEY}`,
+  };
+
+  if (env.GATEWAY_TOKEN) {
+    headers["cf-aig-authorization"] = `Bearer ${env.GATEWAY_TOKEN}`;
+  }
+
+  return headers;
 }
 
 function buildPrompt(host: string, today: string): string {

@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import worker, { DomainDO, buildPrompt, fallbackText, renderPage } from "../src/worker";
+import worker, {
+  DomainDO,
+  buildGatewayHeaders,
+  buildPrompt,
+  fallbackText,
+  renderPage,
+} from "../src/worker";
 
 describe("prompt", () => {
   it("includes host and date", () => {
@@ -19,6 +25,25 @@ describe("fallback", () => {
     const text = fallbackText(host, today);
     expect(text).toContain(host);
     expect(text).toContain(today);
+  });
+});
+
+describe("gateway headers", () => {
+  it("sends the xAI provider key as Authorization", () => {
+    expect(buildGatewayHeaders({ XAI_API_KEY: "xai-key" })).toEqual({
+      "content-type": "application/json",
+      authorization: "Bearer xai-key",
+    });
+  });
+
+  it("sends authenticated Gateway credentials separately", () => {
+    const headers = buildGatewayHeaders({
+      XAI_API_KEY: "xai-key",
+      GATEWAY_TOKEN: "gateway-token",
+    });
+
+    expect(headers.authorization).toBe("Bearer xai-key");
+    expect(headers["cf-aig-authorization"]).toBe("Bearer gateway-token");
   });
 });
 
