@@ -369,10 +369,10 @@ describe("worker fetch", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("# Daily page");
     expect(doFetch).toHaveBeenCalledWith("https://domain-do/daily", {
-      headers: { "x-md-host": "example.com", "x-md-version": "v15" },
+      headers: { "x-md-host": "example.com", "x-md-version": "v16" },
     });
     expect(cache.put).toHaveBeenCalledTimes(1);
-    expect(response.headers.get("x-md-version")).toBe("v15");
+    expect(response.headers.get("x-md-version")).toBe("v16");
     expect(response.headers.get("x-generated-on")).toBe("2025-12-05");
   });
 
@@ -392,7 +392,7 @@ describe("worker fetch", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("# Live page");
     expect(doFetch).toHaveBeenCalledWith("https://domain-do/stream", {
-      headers: { "x-md-host": "example.com", "x-md-version": "v15" },
+      headers: { "x-md-host": "example.com", "x-md-version": "v16" },
     });
     expect(cache.put).not.toHaveBeenCalled();
   });
