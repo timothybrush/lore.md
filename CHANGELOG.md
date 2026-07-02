@@ -1,5 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-07-02
 
-- Coalesce concurrent daily generation inside the per-host Durable Object, support authenticated AI Gateway credentials and Grok routing, refresh the cache namespace after credential repair, harden streaming failure consistency, and bound daily storage growth. Thanks @vincent-peng.
+### Highlights
+
+- Generate one canonical daily page per host by coalescing concurrent `/daily` and `/stream` misses inside the Durable Object. Thanks @vincent-peng for [PR #4](https://github.com/steipete/lore.md/pull/4).
+- Support authenticated Cloudflare AI Gateway credentials and route the public xAI model identifier correctly through `/compat`.
+- Keep streaming clients, stored records, and later daily responses consistent across disconnects, malformed upstream streams, timeouts, and fallback generation.
+- Bound Durable Object storage to one active daily slot per cache version, migrate same-day legacy records safely, and refresh the cache namespace after credential repair.
