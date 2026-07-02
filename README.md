@@ -8,8 +8,9 @@ What it uses
 
 - Cloudflare Worker + Durable Object
 - Cloudflare AI Gateway (OpenAI-compatible) pointing to xAI Grok 4.1 fast reasoning
-- Edge cache 24h + stale-while-revalidate 1h
-- Optional streaming path `/stream` to show generation live on cache misses
+- Edge cache 24h
+- Durable Object request coalescing so cold misses share one daily generation
+- Optional streaming path `/stream` to show the first generation live on cache miss
 
 Quick start
 
@@ -18,28 +19,28 @@ Quick start
 3. From repo root:
    - `wrangler secret put XAI_API_KEY`
    - optional: `wrangler secret put GATEWAY_TOKEN` if your Gateway uses a separate token
-   - set env `GATEWAY_BASE` to your compat URL (or edit the default placeholder in `src/worker.js`).
+   - set env `GATEWAY_BASE` to your compat URL (or edit the default placeholder in `src/worker.ts`); the Worker adds Cloudflare's required `grok/` model namespace for `/compat` URLs.
 4. `wrangler deploy`
 5. Map your domains in Cloudflare Routes/DNS to this worker. Host header drives per-domain text.
 
 Behavior
 
-- One generation per host per UTC day; DO stores `{text, generatedAt}` with ~27h TTL.
-- Edge cache keyed per host/day; headers: `ETag` = `host:date`, `X-Generated-On` = date.
+- One generation per host per UTC day; DO overwrites one `{text, generatedAt}` slot per cache version.
+- Edge cache keyed per host/version/day; headers: `ETag` = `host:version:date`, `X-Generated-On` = date.
 - Prompt: philosophical, host-aware, ~220–400 words, H1 + H2 sections, optional single bullet list, italic closing line.
-- Fallback text is deterministic if the AI call fails.
+- Fallback text is deterministic if the AI call fails, and is stored for that host/day.
 - Footer shows generation date and a right-aligned link “a @steipete project” → https://steipete.me.
-- Streaming: request `/stream` to stream the AI response when there’s no cache; the completed page is cached afterward for normal `/` hits.
+- Streaming: request `/stream` to stream the first uncached generation live through the Durable Object. Concurrent `/` or `/stream` misses wait on the same in-flight generation, so streaming cannot bypass the one-generation-per-day guard. Live responses are not edge-cached; the next normal request caches the completed DO record. Interrupted streams store deterministic fallback text, never partial output, as the daily record.
 
 Testing
 
 - `wrangler dev` then curl twice: `curl -H "Host: yourdomain.test" http://127.0.0.1:8787` and confirm `X-Generated-On` stays fixed.
 - Check AI Gateway analytics to verify only one upstream call per domain per day.
-- Stream test: `curl -N http://127.0.0.1:8787/stream` on a fresh day to observe live output.
+- Stream path test: `curl -N http://127.0.0.1:8787/stream` on a fresh day to observe live output.
 
 Config references
 
-- `src/worker.js`: worker logic, DO class, Gateway call.
+- `src/worker.ts`: worker logic, DO class, Gateway call.
 - `wrangler.toml`: DO binding `DOMAIN_DO`, entrypoint, migration tag.
 - `docs/spec.md`: deeper architecture and ops notes.
 - CI: `.github/workflows/ci.yml` runs `wrangler deploy --dry-run` (needs GitHub secrets: `CLOUDFLARE_API_TOKEN`, `XAI_API_KEY`, and `GATEWAY_BASE`; optional `GATEWAY_TOKEN`).
