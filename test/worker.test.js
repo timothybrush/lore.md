@@ -5,6 +5,7 @@ import worker, {
   buildPrompt,
   fallbackText,
   renderPage,
+  resolveXaiModel,
 } from "../src/worker";
 
 describe("prompt", () => {
@@ -44,6 +45,24 @@ describe("gateway headers", () => {
 
     expect(headers.authorization).toBe("Bearer xai-key");
     expect(headers["cf-aig-authorization"]).toBe("Bearer gateway-token");
+  });
+});
+
+describe("xAI model routing", () => {
+  it("adds the provider namespace for Cloudflare's unified API", () => {
+    expect(resolveXaiModel("https://gateway.ai.cloudflare.com/v1/account/default/compat")).toBe(
+      "grok/grok-4-1-fast-reasoning",
+    );
+    expect(resolveXaiModel("https://gateway.ai.cloudflare.com/v1/account/default/compat/")).toBe(
+      "grok/grok-4-1-fast-reasoning",
+    );
+  });
+
+  it("keeps the public model identifier for provider-native endpoints", () => {
+    expect(resolveXaiModel("https://gateway.ai.cloudflare.com/v1/account/default/grok/v1")).toBe(
+      "grok-4-1-fast-reasoning",
+    );
+    expect(resolveXaiModel("https://api.x.ai/v1")).toBe("grok-4-1-fast-reasoning");
   });
 });
 

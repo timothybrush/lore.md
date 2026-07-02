@@ -1,5 +1,5 @@
 // Daily AI-generated markdown per domain, cached per UTC day.
-// Uses xAI Grok 4.1 fast non-reasoning via Cloudflare AI Gateway (OpenAI-compatible).
+// Uses xAI Grok 4.1 fast reasoning via Cloudflare AI Gateway (OpenAI-compatible).
 
 export interface Env {
   DOMAIN_DO: DurableObjectNamespace;
@@ -21,6 +21,8 @@ type XaiChatCompletion = {
   output_text?: string;
   response?: string;
 };
+
+const XAI_MODEL = "grok-4-1-fast-reasoning";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -74,7 +76,14 @@ export default {
 };
 
 // Export helpers for testing.
-export { buildGatewayHeaders, buildPrompt, fallbackText, generateDailyText, renderPage };
+export {
+  buildGatewayHeaders,
+  buildPrompt,
+  fallbackText,
+  generateDailyText,
+  renderPage,
+  resolveXaiModel,
+};
 
 export class DomainDO {
   state: DurableObjectState;
@@ -305,7 +314,7 @@ async function callXai(env: Env, prompt: string): Promise<string> {
   const apiBase =
     env.GATEWAY_BASE || "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat";
   const body = {
-    model: "grok-4-1-fast-reasoning",
+    model: resolveXaiModel(apiBase),
     messages: [
       {
         role: "system",
@@ -355,7 +364,7 @@ async function callXaiStream(
   const apiBase =
     env.GATEWAY_BASE || "https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat";
   const body = {
-    model: "grok-4-1-fast-reasoning",
+    model: resolveXaiModel(apiBase),
     messages: [
       {
         role: "system",
@@ -441,6 +450,12 @@ function buildGatewayHeaders(env: Env): Record<string, string> {
   }
 
   return headers;
+}
+
+function resolveXaiModel(apiBase: string): string {
+  // Cloudflare's unified API routes by provider prefix; native Grok/xAI endpoints do not.
+  const path = new URL(apiBase).pathname.replace(/\/+$/, "");
+  return path.endsWith("/compat") ? `grok/${XAI_MODEL}` : XAI_MODEL;
 }
 
 function buildPrompt(host: string, today: string): string {

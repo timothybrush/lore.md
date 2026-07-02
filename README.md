@@ -19,7 +19,7 @@ Quick start
 3. From repo root:
    - `wrangler secret put XAI_API_KEY`
    - optional: `wrangler secret put GATEWAY_TOKEN` if your Gateway uses a separate token
-   - set env `GATEWAY_BASE` to your compat URL (or edit the default placeholder in `src/worker.ts`).
+   - set env `GATEWAY_BASE` to your compat URL (or edit the default placeholder in `src/worker.ts`); the Worker adds Cloudflare's required `grok/` model namespace for `/compat` URLs.
 4. `wrangler deploy`
 5. Map your domains in Cloudflare Routes/DNS to this worker. Host header drives per-domain text.
 

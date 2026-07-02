@@ -49,7 +49,7 @@ Config (wrangler.toml)
 
 - Durable Object binding `DOMAIN_DO` with migration tag `v1`.
 - `main = "src/worker.ts"`, `compatibility_date = "2025-12-04"`.
-- Secrets: `XAI_API_KEY`; optional `GATEWAY_TOKEN` for an authenticated Gateway; optional `GATEWAY_BASE` (default placeholder `https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat`). The provider key stays in `Authorization`; the Gateway token is sent separately in `cf-aig-authorization`.
+- Secrets: `XAI_API_KEY`; optional `GATEWAY_TOKEN` for an authenticated Gateway; optional `GATEWAY_BASE` (default placeholder `https://gateway.ai.cloudflare.com/v1/ACCOUNT_ID/GATEWAY_ID/compat`). The provider key stays in `Authorization`; the Gateway token is sent separately in `cf-aig-authorization`. For Cloudflare `/compat` URLs, the Worker adds the required `grok/` provider namespace to the public xAI model identifier.
 
 Deployment steps
 
